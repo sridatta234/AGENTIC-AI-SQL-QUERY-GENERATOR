@@ -63,6 +63,11 @@ async def generate_sql(request: QueryRequest):
             return GenerateResponse(error="Query cannot be empty")
         
         sql_query = generate_sql_query(request.query, request.database)
+        
+        # Check for database relevance validation error
+        if sql_query == "DATABASE_NOT_RELATED":
+            return GenerateResponse(error="Missing database connection. Please specify the target database.")
+        
         if not sql_query:
             return GenerateResponse(error="Failed to generate SQL query. Please try rephrasing your request.")
         
