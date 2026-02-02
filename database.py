@@ -57,9 +57,10 @@ def get_schema(database_name=None):
     """Get schema for specific database or default"""
     target_database = database_name or MYSQL_DATABASE
     query = """
-    SELECT TABLE_NAME, COLUMN_NAME, DATA_TYPE
+    SELECT TABLE_NAME, COLUMN_NAME, DATA_TYPE, ORDINAL_POSITION
     FROM INFORMATION_SCHEMA.COLUMNS
-    WHERE TABLE_SCHEMA = :database;
+    WHERE TABLE_SCHEMA = :database
+    ORDER BY TABLE_NAME, ORDINAL_POSITION;
     """
 
     # Use appropriate engine based on database selection
@@ -71,7 +72,7 @@ def get_schema(database_name=None):
             schema_info = result.fetchall()
 
         schema_dict = {}
-        for table, column, dtype in schema_info:
+        for table, column, dtype, position in schema_info:
             if table not in schema_dict:
                 schema_dict[table] = []
             schema_dict[table].append(f"{column} ({dtype})")

@@ -290,8 +290,21 @@ if st.session_state.get("execution_result"):
         if operation_type.startswith("SELECT"):
             st.dataframe(results, use_container_width=True)
         else:
-            # For non-SELECT operations, show a summary
-            st.json(results)
+            # For non-SELECT operations, show a clear success message
+            if operation_type in ['INSERT', 'UPDATE', 'DELETE']:
+                if rows_affected is not None and rows_affected > 0:
+                    st.success(f"✅ {operation_type} operation completed successfully! {rows_affected} row(s) affected.")
+                elif rows_affected == 0:
+                    st.warning(f"⚠️ {operation_type} operation completed but no rows were affected.")
+                else:
+                    st.success(f"✅ {operation_type} operation completed successfully!")
+            else:
+                # For CREATE, DROP, etc.
+                st.success(f"✅ {operation_type} operation completed successfully!")
+            
+            # Show the detailed status in an expander
+            with st.expander("📋 View Detailed Status"):
+                st.json(results)
     else:
         st.info("No data returned from query execution.")
     

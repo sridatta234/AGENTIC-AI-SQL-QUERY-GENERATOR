@@ -80,7 +80,7 @@ def clean_sql_output(response_text):
     clean_query = re.sub(r"```\n(.*?)\n```", r"\1", clean_query, flags=re.DOTALL)
     
     sql_patterns = [
-        r"(SELECT\s+.*?;)",
+        r"(WITH\s+.*?;)",
         r"(INSERT\s+INTO\s+.*?;)",
         r"(UPDATE\s+.*?;)",
         r"(DELETE\s+FROM\s+.*?;)",
@@ -92,6 +92,7 @@ def clean_sql_output(response_text):
         r"(TRUNCATE\s+TABLE\s+.*?;)",
         r"(CREATE\s+DATABASE\s+.*?;)",
         r"(DROP\s+DATABASE\s+.*?;)",
+        r"(SELECT\s+.*?;)",
     ]
     
     for pattern in sql_patterns:
@@ -109,7 +110,7 @@ def validate_sql_query(sql_query):
             return False, "Invalid SQL syntax."
         
         first_token = str(parsed[0].tokens[0]).upper().strip()
-        valid_operations = ['SELECT', 'INSERT', 'UPDATE', 'DELETE', 'CREATE', 'ALTER', 'DROP', 'TRUNCATE']
+        valid_operations = ['SELECT', 'INSERT', 'UPDATE', 'DELETE', 'CREATE', 'ALTER', 'DROP', 'TRUNCATE', 'WITH']
         
         if not any(first_token.startswith(op) for op in valid_operations):
             return False, "Invalid SQL operation."
@@ -122,7 +123,7 @@ def get_sql_operation_type(sql_query):
     """Determines the type of SQL operation."""
     sql_query = sql_query.upper().strip()
     
-    if sql_query.startswith('SELECT'): return 'SELECT'
+    if sql_query.startswith('SELECT') or sql_query.startswith('WITH'): return 'SELECT'
     elif sql_query.startswith('INSERT'): return 'INSERT'
     elif sql_query.startswith('UPDATE'): return 'UPDATE'
     elif sql_query.startswith('DELETE'): return 'DELETE'
@@ -140,34 +141,146 @@ def get_sql_operation_type(sql_query):
 
 class AgentState(TypedDict):
     nl_query: str
+    refined_query: str  # Added for the cleaned/rephrased query
     database_name: str
     schema: Dict[str, List[str]]
     is_relevant: bool
     error_msg: Optional[str]
     sql_query: Optional[str]
 
+def refine_query_node(state: AgentState):
+    """Node to clean and rephrase the user query into precise technical language."""
+    prompt = f"""
+    You are a SQL expert assistant. Your job is to REPHRASE the user's request into precise, technical natural language that is easy to convert to SQL.
+    
+    User Request: "{state['nl_query']}"
+    
+    Guidelines:
+    1. Correct terminology: 
+       - "Delete database" -> "DROP DATABASE"
+       - "Remove table" -> "DROP TABLE"
+       - "Change column" -> "ALTER TABLE MODIFY COLUMN"
+    2. Clarify intent: Ensure the action (SELECT, INSERT, etc.) is unambiguous.
+    3. Keep it natural language: Do NOT generate SQL code yet. Just describe the action precisely.
+    
+    Example:
+    Input: "delete a database named cricket_info"
+    Output: "Drop the database named 'cricket_info'."
+    
+    Refined Request:
+    """
+    
+    llm = get_llm_model()
+    response = llm.invoke([
+        SystemMessage(content="You are a helpful SQL assistant. Refine the user query for clarity and correctness."),
+        HumanMessage(content=prompt)
+    ])
+    
+    refined = response.content.strip()
+    return {"refined_query": refined}
+
 def check_relevance_node(state: AgentState):
     """Node to check query relevance against schema."""
     schema_text = "\n".join([f"{table}: {', '.join(columns)}" for table, columns in state['schema'].items()])
     
+    # For INSERT operations, check if referenced data exists
+    data_context = ""
+    if "insert" in state['refined_query'].lower():
+        # Try to detect which table is being inserted into
+        import re
+        insert_match = re.search(r'insert.*into\s+(\w+)', state['refined_query'], re.IGNORECASE)
+        if insert_match:
+            target_table = insert_match.group(1)
+            # Check for potential foreign key references
+            if target_table in state['schema']:
+                # Get sample data from related tables to help the agent
+                from database import create_engine_for_database
+                from sqlalchemy import text
+                target_engine = create_engine_for_database(state['database_name']) if state['database_name'] != "default database" else engine
+                
+                try:
+                    with target_engine.connect() as connection:
+                        # Get available data from potential parent tables
+                        available_data = {}
+                        for table_name in state['schema'].keys():
+                            if table_name != target_table:
+                                try:
+                                    result = connection.execute(text(f"SELECT * FROM {table_name} LIMIT 5"))
+                                    rows = result.fetchall()
+                                    if rows:
+                                        available_data[table_name] = len(rows)
+                                except:
+                                    pass
+                        
+                        if available_data:
+                            data_context = f"\n\nAvailable data in related tables: {', '.join([f'{t} ({c} rows)' for t, c in available_data.items()])}"
+                        else:
+                            data_context = "\n\nWARNING: No data found in any related tables. Foreign key references may fail."
+                except:
+                    pass
+    
+    # Use the REFINED query for validation
     validation_prompt = f"""
-    You are a strict database guard. Analyze the user query against the provided database schema.
+    You are a strict database schema validator. Your job is to check if a user query is valid against the provided database schema.
     
-    Database: {state['database_name']}
-    Schema:
-    {schema_text}
+    DATABASE INFORMATION:
+    Database Name: {state['database_name']}
     
-    User Query: "{state['nl_query']}"
+    AVAILABLE SCHEMA:
+    {schema_text}{data_context}
     
-    INSTRUCTIONS:
-    1. IDENTIFY OPERATION: Is this SELECT, INSERT, UPDATE, DELETE, or CREATE/DROP?
-    2. IF SELECT / UPDATE / DELETE: Check if tables/columns exist. REJECT if missing.
-    3. IF INSERT: Check if target table exists. ALLOW new data values.
-    4. IF CREATE: ALLOW creating new tables.
+    USER QUERY TO VALIDATE:
+    "{state['refined_query']}"
     
-    OUTPUT FORMAT (Strictly follow this):
+    VALIDATION RULES:
+    1. IDENTIFY the SQL operation type (SELECT, INSERT, UPDATE, DELETE, CREATE, DROP, ALTER, etc.)
+    
+    2. FOR SELECT/UPDATE/DELETE operations:
+       - Check if ALL mentioned tables exist in the schema
+       - Check if ALL mentioned columns exist in their respective tables
+       - If any table or column is missing, return INVALID_ENTITY
+    
+    3. FOR INSERT operations:
+       - Check if the target table exists in the schema
+       - ALLOW new data values (they don't need to exist yet)
+       - If the table has foreign key columns AND the data context shows no data in parent tables, return INVALID_ENTITY with error "Insufficient data: Parent table(s) are empty. Cannot create foreign key references."
+       - Otherwise, ALLOW the insert
+    
+    4. FOR CREATE/DROP/ALTER operations:
+       - ALLOW creating new tables/databases (they don't need to exist yet)
+       - For DROP operations, check if the target exists
+    
+    5. FOR IRRELEVANT queries:
+       - If the query is not related to databases or SQL, return IRRELEVANT
+       - If the query asks about non-database topics, return IRRELEVANT
+    
+    OUTPUT FORMAT (You MUST follow this exact format):
     Status: [VALID | IRRELEVANT | INVALID_ENTITY]
-    Error: [Error message if invalid, else empty]
+    Error: [Specific error message if status is not VALID, otherwise leave empty]
+    
+    EXAMPLES:
+    
+    Example 1 - Valid SELECT:
+    Query: "Show all customers"
+    Schema has: customer table
+    Output:
+    Status: VALID
+    Error: 
+    
+    Example 2 - Invalid table:
+    Query: "Select from non_existent_table"
+    Schema does NOT have: non_existent_table
+    Output:
+    Status: INVALID_ENTITY
+    Error: Table 'non_existent_table' does not exist in schema
+    
+    Example 3 - Valid CREATE:
+    Query: "Create a new table called products"
+    Output:
+    Status: VALID
+    Error: 
+    
+    Now validate the user query above and provide your response:
     """
     
     llm = get_llm_model()
@@ -180,15 +293,34 @@ def check_relevance_node(state: AgentState):
     status = "VALID"
     error_msg = None
     
+    # Parse the response - handle various formats
     for line in content.split('\n'):
-        if line.startswith("Status:"):
+        line_lower = line.lower().strip()
+        
+        # Check for status (case-insensitive)
+        if line_lower.startswith("status:"):
             status = line.split(":", 1)[1].strip().upper()
-        if line.startswith("Error:"):
-            error_msg = line.split(":", 1)[1].strip()
-            
+        
+        # Check for error (case-insensitive)
+        if line_lower.startswith("error:"):
+            extracted_error = line.split(":", 1)[1].strip()
+            # Only capture non-empty errors
+            if extracted_error and extracted_error.lower() not in ['none', 'empty', 'n/a', '']:
+                error_msg = extracted_error
+    
+    # Also check if status keywords appear anywhere in the response (fallback)
+    content_upper = content.upper()
+    if "INVALID_ENTITY" in content_upper or "INVALID ENTITY" in content_upper:
+        status = "INVALID_ENTITY"
+    elif "IRRELEVANT" in content_upper:
+        status = "IRRELEVANT"
+    elif "VALID" in content_upper and status == "VALID":
+        status = "VALID"
+    
+    # Return based on status
     if "IRRELEVANT" in status:
         return {"is_relevant": False, "error_msg": f"I cannot answer this. {error_msg or 'Query is unrelated to the database.'}"}
-    if "INVALID_ENTITY" in status:
+    if "INVALID_ENTITY" in status or "INVALID" in status:
         return {"is_relevant": False, "error_msg": f"I cannot generate SQL. {error_msg or 'Requested data type missing from schema.'}"}
         
     return {"is_relevant": True, "error_msg": None}
@@ -200,6 +332,16 @@ def generate_sql_node(state: AgentState):
         
     schema_text = "\n".join([f"{table}: {', '.join(columns)}" for table, columns in state['schema'].items()])
     
+    # Load MySQL rules from file
+    mysql_rules = ""
+    try:
+        rules_path = os.path.join(os.path.dirname(__file__), 'mysql_rules.md')
+        with open(rules_path, 'r', encoding='utf-8') as f:
+            mysql_rules = f.read()
+    except:
+        mysql_rules = "MySQL rules file not found. Using default rules."
+    
+    # Use the REFINED query for generation
     prompt = f"""
     You are an expert SQL developer specializing in MySQL. Convert the following natural language request into a complete, optimized MySQL query.
     
@@ -207,7 +349,58 @@ def generate_sql_node(state: AgentState):
     Database Schema:
     {schema_text}
     
-    User Request: {state['nl_query']}
+    User Request: {state['refined_query']}
+    
+    Example 7 (Top N per Group - Correct Approach):
+    Q: "For each store, find the top 3 customers who have spent the most money."
+    SQL:
+    WITH CustomerSpending AS (
+        SELECT s.store_id, c.first_name, c.last_name, SUM(p.amount) AS total_spent,
+        RANK() OVER (PARTITION BY s.store_id ORDER BY SUM(p.amount) DESC) as ranking
+        FROM customer c
+        JOIN payment p ON c.customer_id = p.customer_id
+        JOIN store s ON c.store_id = s.store_id
+        GROUP BY s.store_id, c.customer_id, c.first_name, c.last_name
+    )
+    SELECT * FROM CustomerSpending WHERE ranking <= 3;
+    
+    Example 8 (Delete Duplicates - Keep One Record):
+    Q: "Delete duplicate records of 'Virat Kohli' from players table, keeping only one."
+    SQL:
+    DELETE FROM players
+    WHERE player_id IN (
+        SELECT player_id FROM (
+            SELECT player_id, 
+                   ROW_NUMBER() OVER (PARTITION BY full_name ORDER BY player_id) as rn
+            FROM players
+            WHERE full_name = 'Virat Kohli'
+        ) AS duplicates
+        WHERE rn > 1
+    );
+    
+    
+    IMPORTANT RULES:
+    - You CANNOT delete from a CTE (Common Table Expression). CTEs are read-only.
+    - Always DELETE FROM the actual table name, not from a CTE.
+    - Use subqueries with ROW_NUMBER() to identify duplicates.
+    - For INSERT statements: The columns in the schema are listed in their CORRECT ORDER. Respect this order.
+    - For INSERT with foreign keys: MySQL does NOT support subqueries in VALUES clause.
+    - WRONG: INSERT INTO matches VALUES (1, (SELECT team_id FROM teams WHERE...));
+    - CORRECT: Use INSERT INTO ... SELECT with UNION ALL for multiple rows.
+    - Example for matches table with team1_id and team2_id foreign keys:
+      INSERT INTO matches (match_id, date, venue, team1_id, team2_id)
+      SELECT 1, '2022-01-01', 'Mumbai', 
+             (SELECT team_id FROM teams WHERE team_name='India'),
+             (SELECT team_id FROM teams WHERE team_name='Australia')
+      UNION ALL
+      SELECT 2, '2022-01-15', 'Delhi',
+             (SELECT team_id FROM teams WHERE team_name='India'),
+             (SELECT team_id FROM teams WHERE team_name='Pakistan');
+    - CRITICAL: Each SELECT must have the SAME number of columns as the INSERT column list.
+    
+    
+    COMPREHENSIVE MYSQL RULES & BEST PRACTICES:
+    {mysql_rules}
     
     Generate ANY type of SQL operation (SELECT, INSERT, UPDATE, DELETE, CREATE, etc.).
     - Use proper MySQL syntax.
@@ -233,10 +426,15 @@ def generate_sql_node(state: AgentState):
 def build_graph():
     workflow = StateGraph(AgentState)
     
+    workflow.add_node("refine_query", refine_query_node)
     workflow.add_node("check_relevance", check_relevance_node)
     workflow.add_node("generate_sql", generate_sql_node)
     
-    workflow.set_entry_point("check_relevance")
+    # Start with refinement
+    workflow.set_entry_point("refine_query")
+    
+    # Then check relevance
+    workflow.add_edge("refine_query", "check_relevance")
     
     def relevance_condition(state):
         if state['is_relevant']:
@@ -258,10 +456,17 @@ def generate_sql_query(nl_query, database_name=None):
     """Converts natural language query to an optimized SQL query using LangGraph."""
     try:
         schema = get_schema(database_name)
+        
+        # Check if schema is empty (except for CREATE DATABASE operations)
+        if not schema and not any(keyword in nl_query.lower() for keyword in ['create database', 'create schema']):
+            db_name = database_name or "default database"
+            return f"ERROR: No schema found for database '{db_name}'. The database may be empty or does not exist."
+        
         app = build_graph()
         
         initial_state = {
             "nl_query": nl_query,
+            "refined_query": None,
             "database_name": database_name or "default database",
             "schema": schema,
             "is_relevant": True, # Default assumption
